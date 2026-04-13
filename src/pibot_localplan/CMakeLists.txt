@@ -53,6 +53,7 @@ ament_target_dependencies(dwa_cpp
   rclcpp rclcpp_action tf2 tf2_ros
   geometry_msgs nav_msgs visualization_msgs
   obstacle_detector pibot_msg
+  tf2_geometry_msgs
 )
 
 add_executable(dwa_cpp_replan src/dwa_cpp_replan.cpp)
@@ -60,6 +61,7 @@ ament_target_dependencies(dwa_cpp_replan
   rclcpp rclcpp_action tf2 tf2_ros
   geometry_msgs nav_msgs visualization_msgs
   obstacle_detector pibot_msg
+  tf2_geometry_msgs
 )
 
 

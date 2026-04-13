@@ -8,6 +8,7 @@
 #include <limits>
 #include <array>
 #include <chrono> 
+#include <atomic> 
 
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
@@ -54,11 +55,11 @@ public:
         alpha_ = 10.0;
         beta_ = 1.0;
         rho_ = 0.5;
-        num_ants_ = 5;
+        num_ants_ = 20;
         iterations_ = 6;
         cost_post = 99;
 
-        max_pheromone_ = 100.0; 
+        max_pheromone_ = 50.0; 
 
         c_w_len_ = 0.5;   
         c_w_wp_ = 0.25;   
@@ -82,7 +83,10 @@ public:
             "/costmap/costmap", map_qos,
             std::bind(&ACOPlannerActionServer::map_callback, this, _1), sub_opts);
 
+        path_pub_ = this->create_publisher<nav_msgs::msg::Path>("/improve_aco3/path", 10);
         waypoint_pub_ = this->create_publisher<nav_msgs::msg::Path>("/improve_aco3/waypoints", 10);
+        debug_failed_path_pub_ = this->create_publisher<nav_msgs::msg::Path>("/debug/failed_path", 10);
+        raw_path_pub_ = this->create_publisher<nav_msgs::msg::Path>("/improve_aco3/raw_path", 10);
 
         action_server_ = rclcpp_action::create_server<AcoPlan>(
             this,
@@ -100,15 +104,25 @@ public:
         RCLCPP_INFO(this->get_logger(), "ACO Planner Ready.");
     }
 
+    ~ACOPlannerActionServer() {
+        preempt_requested_ = true;
+        if (execution_thread_.joinable()) {
+            execution_thread_.join();
+        }
+    }
+
 private:
     std::mutex map_lock_;
     nav_msgs::msg::OccupancyGrid map_;
     std::vector<double> pheromone_grid_; 
     
+    // THÊM: Các biến quản lý luồng tính toán
+    std::mutex thread_mutex_;
+    std::thread execution_thread_;
+    std::atomic<bool> preempt_requested_{false};
+    
     geometry_msgs::msg::Pose last_goal_pose_;
     bool has_last_goal_;
-    
-    std::vector<GraphNode> last_full_path_;
 
     double alpha_, beta_, rho_;
     double c_w_len_, c_w_wp_, c_w_theta_; 
@@ -122,7 +136,7 @@ private:
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
     rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
     
-    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr waypoint_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_, waypoint_pub_, debug_failed_path_pub_, raw_path_pub_;
     rclcpp_action::Server<AcoPlan>::SharedPtr action_server_;
     
     std::mt19937 rng_;
@@ -130,6 +144,7 @@ private:
     struct PathResult {
         std::vector<GraphNode> full_path;
         std::vector<GraphNode> chain;    
+        std::vector<GraphNode> raw_path; 
         bool success;
     };
 
@@ -158,7 +173,7 @@ private:
                 cost_post = static_cast<int>(map_.data[idx]);
             }
         } catch (const tf2::TransformException & ex) {
-            // Silently ignore TF errors during goal acceptance
+            RCLCPP_WARN(this->get_logger(), "Không lấy được TF trong handle_goal: %s", ex.what());
         }
 
         return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
@@ -169,8 +184,23 @@ private:
         return rclcpp_action::CancelResponse::ACCEPT;
     }
 
+    // CẬP NHẬT: Quản lý luồng bằng cơ chế chèn ngang (Preemption)
     void handle_accepted(const std::shared_ptr<GoalHandleAcoPlan> goal_handle) {
-        std::thread{std::bind(&ACOPlannerActionServer::execute_callback, this, _1), goal_handle}.detach();
+        std::lock_guard<std::mutex> lock(thread_mutex_);
+        
+        // Nếu đang có luồng chạy -> Bật cờ hủy và chờ nó dừng
+        if (execution_thread_.joinable()) {
+            RCLCPP_WARN(this->get_logger(), "Nhận Goal mới! Đang hủy Goal cũ để tính lại (Replan)...");
+            preempt_requested_ = true;  
+            execution_thread_.join();   // Chờ thuật toán cũ thoát an toàn
+        }
+        
+        // Reset cờ để luồng mới bắt đầu chạy
+        preempt_requested_ = false;
+        
+        execution_thread_ = std::thread([this, goal_handle]() {
+            this->execute_callback(goal_handle);
+        });
     }
 
     GraphNode world_to_grid(double x, double y, const nav_msgs::msg::OccupancyGrid& m) {
@@ -364,6 +394,8 @@ private:
         std::array<double, 8> probs;
 
         for (int step = 0; step < max_steps; ++step) {
+            // CẬP NHẬT: THOÁT KHẨN CẤP nếu có lệnh hủy (để nhận Goal mới)
+            if (preempt_requested_) return {path_f, {}, {}, false}; 
             
             bool meet_in_middle = (dist_sq(curr_f, curr_b) <= 2.0);
             bool forward_reached = (curr_f == goal);
@@ -391,7 +423,7 @@ private:
                 auto optimized_chain = generate_optimal_chain(raw_path, m);
                 auto smoothed_full_path = reconstruct_full_path(optimized_chain);
                 
-                return {smoothed_full_path, optimized_chain, true};
+                return {smoothed_full_path, optimized_chain, raw_path, true};
             }
 
             // DI CHUYỂN KIẾN TIẾN (FORWARD ANT)
@@ -437,7 +469,7 @@ private:
                 if (path_f.size() > 1) {
                     path_f.pop_back(); 
                     curr_f = path_f.back(); 
-                } else { return {path_f, {}, false}; }
+                } else { return {path_f, {}, {}, false}; }
             } else {
                 std::discrete_distribution<> d(probs.begin(), probs.begin() + valid_count_f);
                 curr_f = neighbors[d(rng_)];
@@ -488,7 +520,7 @@ private:
                 if (path_b.size() > 1) {
                     path_b.pop_back(); 
                     curr_b = path_b.back(); 
-                } else { return {path_b, {}, false}; }
+                } else { return {path_b, {}, {}, false}; }
             } else {
                 std::discrete_distribution<> d(probs.begin(), probs.begin() + valid_count_b);
                 curr_b = neighbors[d(rng_)];
@@ -497,7 +529,7 @@ private:
             }
         }
 
-        return {path_f, {}, false}; 
+        return {path_f, {}, {}, false}; 
     }
 
     void update_pheromones(const std::vector<std::vector<GraphNode>>& paths, 
@@ -540,6 +572,12 @@ private:
         }
     }
 
+    void publish_debug_path(const std::vector<GraphNode>& nodes, const nav_msgs::msg::OccupancyGrid& local_map) {
+        if (nodes.empty()) return;
+        auto msg = create_path_msg(nodes, local_map);
+        debug_failed_path_pub_->publish(msg);
+    }
+
     nav_msgs::msg::Path create_path_msg(const std::vector<GraphNode>& nodes, const nav_msgs::msg::OccupancyGrid& local_map) {
         nav_msgs::msg::Path path_msg;
         path_msg.header.frame_id = local_map.header.frame_id;
@@ -564,6 +602,7 @@ private:
         auto feedback = std::make_shared<AcoPlan::Feedback>();
         
         std::vector<GraphNode> final_iteration_best_chain;
+        std::vector<GraphNode> final_iteration_best_raw_path; 
         double final_best_length = std::numeric_limits<double>::infinity();
 
         GraphNode start_node{0,0}, goal_node{0,0};
@@ -584,54 +623,6 @@ private:
 
                 if (dist_to_old_goal > 1.0) {
                     std::fill(pheromone_grid_.begin(), pheromone_grid_.end(), 0.1);
-                } else {
-                    bool path_blocked = false;
-                    int lethal_threshold = 90; 
-
-                    if (!last_full_path_.empty()) {
-                        for (const auto& n : last_full_path_) {
-                            if (n.x >= 0 && n.x < (int)local_map.info.width && 
-                                n.y >= 0 && n.y < (int)local_map.info.height) {
-                                
-                                int idx = n.y * local_map.info.width + n.x;
-                                int8_t cost = local_map.data[idx];
-                                
-                                if (cost == -1 || cost >= lethal_threshold) {
-                                    path_blocked = true;
-                                    break;
-                                }
-                            } else {
-                                path_blocked = true; 
-                                break;
-                            }
-                        }
-                    }
-
-                    if (path_blocked) {
-                        double rho_min = 0.1;
-                        double rho_max = 0.9;
-                        double tau_min = std::numeric_limits<double>::max();
-                        double tau_max = std::numeric_limits<double>::lowest();
-                        
-                        for (double val : pheromone_grid_) {
-                            if (val < tau_min) tau_min = val;
-                            if (val > tau_max) tau_max = val;
-                        }
-
-                        if (std::abs(tau_max - tau_min) < 1e-6) {
-                            for (double& tau_ij : pheromone_grid_) {
-                                tau_ij = (1.0 - rho_min) * tau_ij; 
-                            }
-                        } else {
-                            for (double& tau_ij : pheromone_grid_) {
-                                double rho_star_ij = rho_min + (rho_max - rho_min) * ((tau_ij - tau_min) / (tau_max - tau_min));
-                                tau_ij = (1.0 - rho_star_ij) * tau_ij;
-                                if (tau_ij < 0.01) {
-                                    tau_ij = 0.01;
-                                }
-                            }
-                        }
-                    }
                 }
             } else {
                 has_last_goal_ = true;
@@ -639,33 +630,43 @@ private:
             last_goal_pose_ = goal_pose;
 
         } catch (const tf2::TransformException & ex) {
-            RCLCPP_INFO(this->get_logger(), "Path not found.");
+            RCLCPP_ERROR(this->get_logger(), "TF Error: %s", ex.what());
             goal_handle->abort(result);
             return;
         }
 
         if (!start_safe(start_node, local_map)) {
-            RCLCPP_INFO(this->get_logger(), "Path not found.");
+            RCLCPP_ERROR(this->get_logger(), "Start is in a static obstacle");
             goal_handle->abort(result);
             return;
         }
 
+        auto start_time = std::chrono::high_resolution_clock::now();
         double epsilon = 0.001; 
 
         for (int i = 0; i < iterations_; ++i) {
-            if (goal_handle->is_canceling()) {
-                goal_handle->canceled(result);
-                return;
+            // CẬP NHẬT: Kiểm tra Hủy từ phía ROS 2 hoặc do có Goal mới chèn vào
+            if (goal_handle->is_canceling() || preempt_requested_) {
+                if (preempt_requested_) {
+                    goal_handle->abort(result); // Báo Goal này bị loại bỏ để nhường chỗ
+                } else {
+                    goal_handle->canceled(result);
+                }
+                return; // Thoát luồng ngay lập tức
             }
 
             std::vector<std::vector<GraphNode>> optimized_paths;
             std::vector<std::vector<GraphNode>> optimized_chains;
+            std::vector<std::vector<GraphNode>> raw_paths; 
             
             std::vector<double> L_list;
             std::vector<double> W_list;
             std::vector<double> Theta_list;
 
             for (int ant = 0; ant < num_ants_; ++ant) {
+                // CẬP NHẬT: Thoát vòng lặp kiến sớm nếu có yêu cầu Hủy
+                if (preempt_requested_) break;
+
                 PathResult pr = construct_solution(start_node, goal_node, local_map);
                 if (pr.success) {
                     double smoothed_len = calculate_path_length(pr.chain, local_map.info.resolution);
@@ -674,12 +675,15 @@ private:
 
                     optimized_paths.push_back(pr.full_path);
                     optimized_chains.push_back(pr.chain);
+                    raw_paths.push_back(pr.raw_path); 
                     
                     L_list.push_back(smoothed_len);
                     W_list.push_back(wp_count);
                     Theta_list.push_back(mean_sq_angle);
                 }
             }
+            
+            if (preempt_requested_) return; // Kiểm tra thêm lần nữa trước khi update Pheromone
 
             if (!optimized_paths.empty()) {
                 double L_max = *std::max_element(L_list.begin(), L_list.end());
@@ -705,6 +709,7 @@ private:
                 if (current_iter_best_len < final_best_length - epsilon) {
                     final_best_length = current_iter_best_len;
                     final_iteration_best_chain = optimized_chains[current_iter_best_idx];
+                    final_iteration_best_raw_path = raw_paths[current_iter_best_idx];
                 }
 
                 std::vector<int> best_indices;
@@ -732,23 +737,29 @@ private:
                 feedback->iteration = i;
                 feedback->current_best_length = final_best_length; 
                 goal_handle->publish_feedback(feedback);
+            } else {
+                RCLCPP_WARN(this->get_logger(), " Iteration %d:path not found.", i);
             }
         }
 
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto total_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+
         if (!final_iteration_best_chain.empty()) {
             auto final_full_nodes = reconstruct_full_path(final_iteration_best_chain);
-            last_full_path_ = final_full_nodes;
-            
+            auto full_msg = create_path_msg(final_full_nodes, local_map);
             auto wp_msg = create_path_msg(final_iteration_best_chain, local_map);
+            auto raw_msg = create_path_msg(final_iteration_best_raw_path, local_map); 
+            
+            path_pub_->publish(full_msg);
             waypoint_pub_->publish(wp_msg);
+            raw_path_pub_->publish(raw_msg); 
             
-            result->path = wp_msg;
+            result->path = full_msg; 
             result->total_length = final_best_length;
-            
-            RCLCPP_INFO(this->get_logger(), "Path found successfully.");
             goal_handle->succeed(result);
         } else {
-            RCLCPP_INFO(this->get_logger(), "Path not found.");
+            RCLCPP_ERROR(this->get_logger(), " failed after %ld ms", total_duration_ms);
             goal_handle->abort(result);
         }
     }
@@ -758,9 +769,11 @@ int main(int argc, char ** argv)
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<ACOPlannerActionServer>();
-    rclcpp::executors::MultiThreadedExecutor executor;
+    
+    rclcpp::executors::SingleThreadedExecutor executor;
     executor.add_node(node);
     executor.spin();
+    
     rclcpp::shutdown();
     return 0;
 }

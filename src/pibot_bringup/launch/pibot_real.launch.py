@@ -99,6 +99,4 @@ def generate_launch_description():
         laser_driver,
         local_localization,
         global_localization,
-        local_plan,
-        global_plan
     ])
