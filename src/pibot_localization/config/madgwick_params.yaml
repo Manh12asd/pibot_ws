@@ -1,0 +1,11 @@
+imu_filter_madgwick_node:
+  ros__parameters:
+    use_mag: false          
+    publish_tf: false      
+    world_frame: "enu"     
+    gain: 0.1               
+    zeta: 0.0               
+    mag_bias_x: 0.0
+    mag_bias_y: 0.0
+    mag_bias_z: 0.0
+    orientation_stddev: 0.001
